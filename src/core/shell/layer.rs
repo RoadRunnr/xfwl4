@@ -18,22 +18,29 @@
 use std::cell::Cell;
 
 use smithay::{
+    backend::renderer::utils::with_renderer_surface_state,
     desktop::{LayerSurface, WindowSurfaceType, layer_map_for_output},
     output::{Output, WeakOutput},
     reexports::wayland_server::protocol::{wl_output, wl_surface::WlSurface},
-    utils::{Logical, Rectangle},
+    utils::{Logical, Rectangle, SERIAL_COUNTER},
     wayland::shell::{
-        wlr_layer::{KeyboardInteractivity, Layer, LayerSurface as WlrLayerSurface, WlrLayerShellHandler, WlrLayerShellState},
+        wlr_layer::{ExclusiveZone, KeyboardInteractivity, Layer, LayerSurface as WlrLayerSurface, WlrLayerShellHandler, WlrLayerShellState},
         xdg::PopupSurface,
     },
 };
 
-use crate::{backend::Backend, core::state::Xfwl4State};
+use crate::{
+    backend::Backend,
+    core::{focus::KeyboardFocusTarget, state::Xfwl4State},
+};
 
 #[derive(Debug, Default)]
 struct LastLayerBbox(Cell<Option<Rectangle<i32, Logical>>>);
 #[derive(Debug, Default)]
 struct RequestedOutput(Option<WeakOutput>);
+/// Whether the layer surface had a buffer at its last commit.
+#[derive(Debug, Default)]
+struct LayerMapped(Cell<bool>);
 
 impl<BackendData: Backend> WlrLayerShellHandler for Xfwl4State<BackendData> {
     fn shell_state(&mut self) -> &mut WlrLayerShellState {
@@ -83,12 +90,17 @@ impl<BackendData: Backend> WlrLayerShellHandler for Xfwl4State<BackendData> {
                 .cloned();
 
             if let Some(output) = output {
+                let had_focus = self.layer_surface_has_keyboard_focus(surface.wl_surface());
                 let mut map = layer_map_for_output(&output);
                 let layer = map.layers().find(|&layer| layer.layer_surface() == &surface).cloned();
                 if let Some(layer) = layer {
                     map.unmap_layer(&layer);
                 }
                 drop(map);
+
+                if had_focus {
+                    self.focus_active_window_after_layer();
+                }
 
                 self.core.set_pointer_focus_dirty();
                 self.output_workarea_changed(&output);
@@ -223,6 +235,8 @@ impl<BackendData: Backend + 'static> Xfwl4State<BackendData> {
             });
             drop(map);
 
+            self.update_layer_focus_on_map_change(surface, &output);
+
             if layout_changed || bbox_changed {
                 self.core.set_pointer_focus_dirty();
             }
@@ -233,6 +247,72 @@ impl<BackendData: Backend + 'static> Xfwl4State<BackendData> {
 
             self.schedule_render_output(&output);
         };
+    }
+}
+
+impl<BackendData: Backend + 'static> Xfwl4State<BackendData> {
+    /// Gives a layer surface above the windows (top or overlay layer) that accepts keyboard
+    /// input the keyboard focus when it maps, and hands focus back to the active window when it
+    /// unmaps while focused.
+    ///
+    /// For `on_demand` the protocol leaves this to the compositor, but menus and launchers
+    /// (xfce4-whiskermenu-plugin, for one) rely on it: they close on focus-out, which never
+    /// comes if they were never focused.  labwc does the same; layer surfaces below the windows,
+    /// and ones that reserve an exclusive zone, are left alone so a restarting desktop or a panel
+    /// re-mapped after an output change does not steal focus.
+    fn update_layer_focus_on_map_change(&mut self, surface: &WlSurface, output: &Output) {
+        let has_buffer = with_renderer_surface_state(surface, |state| state.buffer().is_some()).unwrap_or(false);
+        let Some(layer) = layer_map_for_output(output)
+            .layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
+            .cloned()
+        else {
+            return;
+        };
+        let was_mapped = layer.user_data().get_or_insert(LayerMapped::default).0.replace(has_buffer);
+
+        if !has_buffer {
+            if was_mapped && self.layer_surface_has_keyboard_focus(surface) {
+                self.focus_active_window_after_layer();
+            }
+            return;
+        }
+
+        if was_mapped || self.core.session_is_locked() {
+            return;
+        }
+
+        // A surface that reserves screen space (a panel with struts) is part of the desktop, not
+        // something the user just opened, so it is left to click-to-focus like a desktop layer.
+        let wants_focus = layer.layer_surface().with_cached_state(|data| {
+            data.keyboard_interactivity != KeyboardInteractivity::None
+                && matches!(data.layer, Layer::Top | Layer::Overlay)
+                && !matches!(data.exclusive_zone, ExclusiveZone::Exclusive(_))
+        });
+        // Don't take the keyboard away from another layer surface that demands it exclusively.
+        let blocked = self
+            .layer_surface_with_exclusive_focus()
+            .is_some_and(|exclusive| exclusive.wl_surface() != surface);
+
+        if wants_focus && !blocked {
+            self.focus_target(layer, SERIAL_COUNTER.next_serial(), None);
+        }
+    }
+
+    fn layer_surface_has_keyboard_focus(&self, surface: &WlSurface) -> bool {
+        self.core
+            .seat
+            .get_keyboard()
+            .and_then(|keyboard| keyboard.current_focus())
+            .is_some_and(|focus| matches!(focus, KeyboardFocusTarget::LayerSurface(layer) if layer.wl_surface() == surface))
+    }
+
+    fn focus_active_window_after_layer(&mut self) {
+        let serial = SERIAL_COUNTER.next_serial();
+        if let Some(window) = self.core.workspace_manager.active_workspace().active_window().cloned() {
+            self.focus_target(window, serial, None);
+        } else if let Some(keyboard) = self.core.seat.get_keyboard() {
+            keyboard.set_focus(self, None, serial);
+        }
     }
 }
 
