@@ -280,11 +280,12 @@ pub fn output_for_unplaced_window<BackendData: Backend + 'static>(
         .cloned()
 }
 
-/// `pointer_location` is read lazily, and only on the last fallback.  It must stay that
-/// way: a pointer grab handler runs with the pointer's mutex held, so reading the pointer
-/// position anywhere a grab can reach deadlocks the compositor against itself.  Every
-/// caller reachable from a grab passes an `anchor`, which is answered before the closure
-/// is ever invoked.
+/// `pointer_location` is read lazily: only for a window that is on no output yet, or, when
+/// there is no `anchor`, for one that spans several outputs.  It must stay that way: a
+/// pointer grab handler runs with the pointer's mutex held, so reading the pointer position
+/// anywhere a grab can reach deadlocks the compositor against itself.  Every caller
+/// reachable from a grab passes an `anchor`, which is answered before the closure is ever
+/// invoked.
 pub fn output_and_geom_for_anchored_layout<BackendData: Backend + 'static, F>(
     workspace_manager: &WorkspaceManager<BackendData>,
     window: &WindowElement,
@@ -294,12 +295,57 @@ pub fn output_and_geom_for_anchored_layout<BackendData: Backend + 'static, F>(
 where
     F: FnOnce() -> Point<f64, Logical>,
 {
-    anchor
-        .and_then(|p| workspace_manager.output_under(p).next().cloned())
-        .or_else(|| window.props().anchored_output.as_ref().and_then(|weak| weak.upgrade()))
-        .or_else(|| workspace_manager.outputs_for_window(window).first().cloned())
-        .or_else(|| output_for_unplaced_window(workspace_manager, pointer_location()))
-        .and_then(|output| workspace_manager.output_geometry(&output).map(|geom| (output, geom)))
+    let anchored_output = window.props().anchored_output.as_ref().and_then(|weak| weak.upgrade());
+
+    let output = if let Some(output) = anchor.and_then(|p| workspace_manager.output_under(p).next().cloned()) {
+        Some(output)
+    } else if anchored_output.is_some() {
+        anchored_output
+    } else {
+        let outputs = workspace_manager.outputs_for_window(window);
+        match outputs.len() {
+            0 => output_for_unplaced_window(workspace_manager, pointer_location()),
+            1 => outputs.into_iter().next(),
+            // Only read the pointer when there is no anchor: every grab-reachable caller passes one.
+            _ => main_output_for_window(workspace_manager, window, &outputs, anchor.is_none().then(pointer_location)),
+        }
+    };
+
+    output.and_then(|output| workspace_manager.output_geometry(&output).map(|geom| (output, geom)))
+}
+
+/// Picks one of `outputs`, the outputs a window overlaps, as the one the window is on.
+///
+/// `outputs_for_window()` comes from an unordered map and counts the whole bbox, shadows
+/// included, so its first entry is an arbitrary one of them.  If the pointer is inside the
+/// window (the user just double-clicked its titlebar, say), use the output under the pointer;
+/// otherwise the output that holds the largest part of the window's geometry.
+fn main_output_for_window<BackendData: Backend + 'static>(
+    workspace_manager: &WorkspaceManager<BackendData>,
+    window: &WindowElement,
+    outputs: &[Output],
+    pointer_location: Option<Point<f64, Logical>>,
+) -> Option<Output> {
+    let geometry = workspace_manager.window_geometry(window);
+
+    pointer_location
+        .filter(|pointer| geometry.is_some_and(|geom| geom.to_f64().contains(*pointer)))
+        .and_then(|pointer| workspace_manager.output_under(pointer).find(|output| outputs.contains(output)).cloned())
+        .or_else(|| {
+            geometry.and_then(|geom| {
+                outputs
+                    .iter()
+                    .filter_map(|output| {
+                        workspace_manager
+                            .output_geometry(output)
+                            .and_then(|output_geom| output_geom.intersection(geom))
+                            .map(|overlap| (output, i64::from(overlap.size.w) * i64::from(overlap.size.h)))
+                    })
+                    .max_by_key(|(_, area)| *area)
+                    .map(|(output, _)| output.clone())
+            })
+        })
+        .or_else(|| outputs.first().cloned())
 }
 
 impl TileMode {
