@@ -341,7 +341,12 @@ impl<BackendData: Backend> XwmHandler for Xfwl4State<BackendData> {
     }
 
     fn configure_notify(&mut self, _xwm: XwmId, surface: X11Surface, geometry: Rectangle<i32, Logical>, above: Option<u32>) {
-        if let Some(window) = self.core.x11_find_window_for_surface(&surface) {
+        // Managed windows only move when we configure them, so their ConfigureNotify is an echo of
+        // an earlier configure.  Relocating to it would configure again, and with several configures
+        // in flight during a move the old positions would bounce back and forth forever.
+        if surface.is_override_redirect()
+            && let Some(window) = self.core.x11_find_window_for_surface(&surface)
+        {
             // `geometry.loc` is the X11 rect origin.  For CSD X11 windows the Space
             // position represents the visible-content origin (so smithay's
             // `render_location = Space - geometry().loc` cancels the extents offset
@@ -352,14 +357,12 @@ impl<BackendData: Backend> XwmHandler for Xfwl4State<BackendData> {
             new_loc.y += frame_extents.top;
             self.relocate_window(&window, new_loc);
 
-            if surface.is_override_redirect() {
-                match above {
-                    None => self.core.workspace_manager.x11_restack_override_redirect(&window, None),
-                    // A sibling we can't resolve (e.g. not mapped yet) is left as-is, not sunk to the bottom.
-                    Some(sibling_id) => {
-                        if let Some(sibling) = self.core.x11_find_window(sibling_id) {
-                            self.core.workspace_manager.x11_restack_override_redirect(&window, Some(&sibling));
-                        }
+            match above {
+                None => self.core.workspace_manager.x11_restack_override_redirect(&window, None),
+                // A sibling we can't resolve (e.g. not mapped yet) is left as-is, not sunk to the bottom.
+                Some(sibling_id) => {
+                    if let Some(sibling) = self.core.x11_find_window(sibling_id) {
+                        self.core.workspace_manager.x11_restack_override_redirect(&window, Some(&sibling));
                     }
                 }
             }
