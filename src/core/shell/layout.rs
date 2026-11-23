@@ -262,17 +262,65 @@ pub fn tile_zone_for_pointer(pointer: Point<f64, Logical>, output_geom: Rectangl
         .copied()
 }
 
-pub fn output_and_geom_for_anchored_layout<BackendData: Backend + 'static>(
+/// `pointer_location` is read lazily, only for a window that spans several outputs and only
+/// when there is no `anchor`.  It must stay that way: a pointer grab handler runs with the
+/// pointer's mutex held, so reading the pointer position anywhere a grab can reach deadlocks
+/// the compositor against itself.  Every caller reachable from a grab passes an `anchor`.
+pub fn output_and_geom_for_anchored_layout<BackendData: Backend + 'static, F>(
     workspace_manager: &WorkspaceManager<BackendData>,
     window: &WindowElement,
     anchor: Option<Point<f64, Logical>>,
-) -> Option<(Output, Rectangle<i32, Logical>)> {
+    pointer_location: F,
+) -> Option<(Output, Rectangle<i32, Logical>)>
+where
+    F: FnOnce() -> Point<f64, Logical>,
+{
     anchor
         .and_then(|p| workspace_manager.output_under(p).next().cloned())
         .or_else(|| window.props().anchored_output.as_ref().and_then(|weak| weak.upgrade()))
-        .or_else(|| workspace_manager.outputs_for_window(window).first().cloned())
+        .or_else(|| {
+            let outputs = workspace_manager.outputs_for_window(window);
+            match outputs.len() {
+                0 | 1 => outputs.into_iter().next(),
+                _ => main_output_for_window(workspace_manager, window, &outputs, anchor.is_none().then(pointer_location)),
+            }
+        })
         .or_else(|| workspace_manager.outputs().next().cloned())
         .and_then(|output| workspace_manager.output_geometry(&output).map(|geom| (output, geom)))
+}
+
+/// Picks one of `outputs`, the outputs a window overlaps, as the one the window is on.
+///
+/// `outputs_for_window()` comes from an unordered map and counts the whole bbox, shadows
+/// included, so its first entry is an arbitrary one of them.  If the pointer is inside the
+/// window (the user just double-clicked its titlebar, say), use the output under the pointer;
+/// otherwise the output that holds the largest part of the window's geometry.
+fn main_output_for_window<BackendData: Backend + 'static>(
+    workspace_manager: &WorkspaceManager<BackendData>,
+    window: &WindowElement,
+    outputs: &[Output],
+    pointer_location: Option<Point<f64, Logical>>,
+) -> Option<Output> {
+    let geometry = workspace_manager.window_geometry(window);
+
+    pointer_location
+        .filter(|pointer| geometry.is_some_and(|geom| geom.to_f64().contains(*pointer)))
+        .and_then(|pointer| workspace_manager.output_under(pointer).find(|output| outputs.contains(output)).cloned())
+        .or_else(|| {
+            geometry.and_then(|geom| {
+                outputs
+                    .iter()
+                    .filter_map(|output| {
+                        workspace_manager
+                            .output_geometry(output)
+                            .and_then(|output_geom| output_geom.intersection(geom))
+                            .map(|overlap| (output, i64::from(overlap.size.w) * i64::from(overlap.size.h)))
+                    })
+                    .max_by_key(|(_, area)| *area)
+                    .map(|(output, _)| output.clone())
+            })
+        })
+        .or_else(|| outputs.first().cloned())
 }
 
 impl TileMode {
