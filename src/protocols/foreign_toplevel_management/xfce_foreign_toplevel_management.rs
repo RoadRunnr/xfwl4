@@ -52,7 +52,6 @@ use crate::protocols::{
 };
 
 const PROTO_VERSION: u32 = 2;
-const INVALID_HANDLE_DEPRECATED_SINCE: u32 = 2;
 
 pub struct XfceForeignToplevelManagementState {
     _global: GlobalId,
@@ -363,9 +362,8 @@ where
                     }
                 } else {
                     let _instance = data_init.init(id, ToplevelHandleData(Arc::new(ToplevelId("dummy".to_owned()))));
-                    if resource.version() < INVALID_HANDLE_DEPRECATED_SINCE {
-                        resource.post_error(Error::InvalidHandle, "passed wlr handle is invalid");
-                    }
+                    // v1 clients get the inert object too: libxfce4windowing up to 4.20.7 binds v1, and
+                    // for it the race is just as unavoidable.
                 }
             }
 
